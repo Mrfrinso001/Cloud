@@ -33,15 +33,9 @@ jobs:
           $job = Start-Job {
             try {
               $resp = curl -s --max-time 20 -u "$using:TAILSCALE_API_KEY:`"" $using:baseUrl
-              if (-not $resp) {
-                Write-Host "No response from Tailscale API."
-                return
-              }
+              if (-not $resp) { Write-Host "No response from Tailscale API."; return }
               $machines = ($resp.Content | ConvertFrom-Json).machines
-              if (-not $machines) {
-                Write-Host "No machines in tailnet."
-                return
-              }
+              if (-not $machines) { Write-Host "No machines in tailnet."; return }
               $ghosts = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" -and -not $_.online }
               if (-not $ghosts) {
                 Write-Host "No ghost machines to remove."
@@ -56,9 +50,9 @@ jobs:
             }
           }
 
-          # Timeout after 300s (5 minutes) to avoid blocking
-          if (-not (Wait-Job $job -Timeout 300)) {
-            Write-Warning "Ghost cleanup timed out after 5 minutes, skipping..."
+          # Timeout after 120s (2 minutes) to avoid blocking
+          if (-not (Wait-Job $job -Timeout 120)) {
+            Write-Warning "Ghost cleanup timed out after 2 minutes, skipping..."
             Stop-Job $job | Out-Null
           }
           Remove-Job $job | Out-Null
@@ -86,20 +80,19 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
-          $securePass = ConvertTo-SecureString $finalPassword -AsPlainText -Force
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            try { Set-LocalUser -Name $username -Password $securePass }
-            catch {
-              Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-            }
+            Write-Host "Updating password for existing user $username"
+            net user $username $finalPassword
           } else {
+            Write-Host "Creating new user $username"
+            $securePass = ConvertTo-SecureString $finalPassword -AsPlainText -Force
             New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           }
 
           Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: $username | Password: $finalPassword"
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$finalPassword"
 
       - name: Install Tailscale
         shell: pwsh
@@ -126,20 +119,26 @@ jobs:
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
 
-      - name: Maintain Connection (Show MagicDNS + creds)
+      - name: Display Connection Info
         shell: pwsh
         run: |
           $TailnetDomain = "taila2a6d7.ts.net"
           $hostname = "rdp-ci-node.$TailnetDomain"
 
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Connect using MagicDNS: $hostname"
-          Write-Host "Fallback IP: $env:TAILSCALE_IP"
-          $creds = (Get-Content $env:GITHUB_ENV | Where-Object { $_ -like 'RDP_CREDS=*' })
-          Write-Host $creds
-          Write-Host "==================`n"
+          Write-Host "`n=== RDP ACCESS DETAILS ==="
+          Write-Host "Tailscale IPv4 : $env:TAILSCALE_IP"
+          Write-Host "MagicDNS Host  : $hostname"
+          Write-Host "RDP Username   : $env:RDP_USER"
+          Write-Host "RDP Password   : $env:RDP_PASS"
+          Write-Host "==========================`n"
+
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          $TailnetDomain = "taila2a6d7.ts.net"
+          $hostname = "rdp-ci-node.$TailnetDomain"
 
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active → Connect via DNS $hostname"
+            Write-Host "[$(Get-Date)] RDP active → Connect via $hostname or IP $env:TAILSCALE_IP"
             Start-Sleep -Seconds 300
           }
