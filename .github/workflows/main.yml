@@ -42,9 +42,9 @@ jobs:
           if (-not $targets) {
             Write-Host "✅ No rdp-ci-node machines found."
           } else {
-            # Sort by lastSeen, pick newest
+            # Sort by lastSeen, keep only most recent
             $latest = $targets | Sort-Object lastSeen -Descending | Select-Object -First 1
-            Write-Host "Keeping newest node: $($latest.hostname) [id=$($latest.id)] lastSeen=$($latest.lastSeen)"
+            Write-Host "Keeping newest: $($latest.hostname) id=$($latest.id)"
 
             $ghosts = $targets | Where-Object { $_.id -ne $latest.id }
 
@@ -52,8 +52,9 @@ jobs:
               Write-Host "✅ No ghosts to delete."
             } else {
               foreach ($g in $ghosts) {
-                Write-Host "🗑 Deleting ghost: $($g.hostname) id=$($g.id) stableId=$($g.stableId) lastSeen=$($g.lastSeen)"
-                $deleteUrl = "https://api.tailscale.com/api/v2/device/$($g.id)"
+                $deviceId = $g.id
+                Write-Host "🗑 Deleting ghost: $($g.hostname) id=$deviceId lastSeen=$($g.lastSeen)"
+                $deleteUrl = "https://api.tailscale.com/api/v2/device/$deviceId"
                 $delResp = curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" $deleteUrl
                 Write-Host "API Response: $delResp"
               }
@@ -74,7 +75,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User (with net user)
+      - name: Create/Update RDP User with net user
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
