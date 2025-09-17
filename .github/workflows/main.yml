@@ -27,43 +27,35 @@ jobs:
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
         run: |
-          $tailnet     = "taila2a6d7.ts.net"
-          $machinesUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
+          $tailnet = "taila2a6d7.ts.net"
+          $baseUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
 
-          Write-Host "📡 Fetching machine list..."
-          $resp = curl -s -u "$env:TAILSCALE_API_KEY:`"" $machinesUrl
-          if (-not $resp) { Write-Host "❌ No response from Tailscale API"; exit 0 }
-
-          $machines = ($resp.Content | ConvertFrom-Json).machines
-          if (-not $machines) { Write-Host "✅ No machines in tailnet."; exit 0 }
-
-          # Show what we found
-          $machines | ForEach-Object { Write-Host "Found: $($_.hostname) id=$($_.id) stableId=$($_.stableId) lastSeen=$($_.lastSeen)" }
-
-          $targets = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" }
-
-          if (-not $targets) {
-            Write-Host "✅ No rdp-ci-node machines found."
-          } else {
-            # Sort by lastSeen, keep the newest
-            $latest = $targets | Sort-Object lastSeen -Descending | Select-Object -First 1
-            Write-Host "Keeping newest node: $($latest.hostname) id=$($latest.id)"
-
-            $ghosts = $targets | Where-Object { $_.id -ne $latest.id }
-
-            if (-not $ghosts) {
-              Write-Host "✅ No ghosts to delete."
-            } else {
-              foreach ($g in $ghosts) {
-                $deviceId = [string]$g.id
-                if (-not $deviceId) { $deviceId = [string]$g.stableId }
-                Write-Host "🗑 Deleting ghost: $($g.hostname) id=$deviceId lastSeen=$($g.lastSeen)"
-                $deleteUrl = "https://api.tailscale.com/api/v2/device/$deviceId"
-                $delResp = curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" $deleteUrl
-                Write-Host "API Response: $delResp"
+          $job = Start-Job {
+            try {
+              $resp = curl -s --max-time 20 -u "$using:TAILSCALE_API_KEY:`"" $using:baseUrl
+              if (-not $resp) { Write-Host "No response from Tailscale API."; return }
+              $machines = ($resp.Content | ConvertFrom-Json).machines
+              if (-not $machines) { Write-Host "No machines in tailnet."; return }
+              $ghosts = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" -and -not $_.online }
+              if (-not $ghosts) {
+                Write-Host "No ghost machines to remove."
+              } else {
+                foreach ($m in $ghosts) {
+                  Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
+                  curl -s --max-time 10 -X DELETE -u "$using:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)" | Out-Null
+                }
               }
+            } catch {
+              Write-Warning "Ghost cleanup failed: $($_.Exception.Message)"
             }
           }
+
+          # Timeout after 30s
+          if (-not (Wait-Job $job -Timeout 30)) {
+            Write-Warning "Ghost cleanup timed out after 30 seconds, skipping..."
+            Stop-Job $job | Out-Null
+          }
+          Remove-Job $job | Out-Null
 
       - name: Configure Core RDP Settings
         shell: pwsh
@@ -75,11 +67,11 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing firewall rule"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User
+      - name: Create/Update RDP User (with net user)
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
@@ -88,7 +80,8 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
-          Write-Host "🔑 Ensuring user $username with password"
+          # Create or update user with guaranteed net user
+          Write-Host "Ensuring user $username exists with given password..."
           net user $username $finalPassword /add
           net localgroup "Administrators" $username /add
           net localgroup "Remote Desktop Users" $username /add
@@ -111,7 +104,7 @@ jobs:
             --authkey=${{ secrets.TAILSCALE_AUTH }} `
             --hostname=rdp-ci-node `
             --accept-routes --accept-dns
-          
+
           $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
 
@@ -119,8 +112,7 @@ jobs:
         shell: pwsh
         run: |
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { Write-Host "❌ RDP port unreachable"; exit 1 }
-          else { Write-Host "✅ RDP port open & reachable" }
+          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
 
       - name: Display Connection Info
         shell: pwsh
@@ -142,6 +134,6 @@ jobs:
           $hostname = "rdp-ci-node.$TailnetDomain"
 
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active → Connect via DNS $hostname or IP $env:TAILSCALE_IP"
+            Write-Host "[$(Get-Date)] RDP Active → Connect via $hostname or IP $env:TAILSCALE_IP"
             Start-Sleep -Seconds 300
           }
