@@ -1,0 +1,75 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'RDP username'
+        required: false
+        default: 'RDP'
+      password:
+        description: 'RDP password (blank → default BlackHole38)'
+        required: false
+        default: ''
+      allow_weak_password:
+        description: 'Set "true" if you really want to allow weak passwords (not recommended)'
+        required: false
+        default: 'false'
+
+  # Auto restart every 5 hours
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Cleanup old Tailscale ghosts
+        shell: pwsh
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          $tailnet = "taila10787.ts.net"
+          $baseUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
+
+          try {
+            $resp = curl -s -u "$env:TAILSCALE_API_KEY:`"" $baseUrl
+            $machines = ($resp.Content | ConvertFrom-Json).machines
+            foreach ($m in $machines) {
+              if ($m.hostname -like "rdp-ci-node*") {
+                if (-not $m.online) {
+                  Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
+                  curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)"
+                }
+              }
+            }
+          } catch {
+            Write-Warning "Ghost cleanup failed or skipped"
+          }
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create/Update RDP User
+        shell: pwsh
+        env:
+          INPUT_USERNAME: ${{ github.event.inputs.username }}
+          INPUT_PASSWORD: ${{ github.event.inputs.password }}
+          INPUT_ALLOW_WEAK: ${{ github.event.inputs.allow_weak_password }}
+        run: |
+          $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
+          $inputPassword = if ($env:INPUT_PASSWORD -eq '') { $null } else { $env:INPUT_PASSWORD }
+          $allowWeak = ($env:INPUT_ALLOW_WEAK -eq 'true')
