@@ -11,10 +11,6 @@ on:
         description: 'RDP password (blank → default BlackHole38)'
         required: false
         default: ''
-      allow_weak_password:
-        description: 'Set "true" if you really want to allow weak passwords (not recommended)'
-        required: false
-        default: 'false'
 
   # Auto restart every 5 hours
   schedule:
@@ -26,28 +22,36 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Cleanup old Tailscale ghosts
+      - name: Cleanup old Tailscale ghosts (with timeout)
         shell: pwsh
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
         run: |
-          $tailnet = "taila10787.ts.net"
+          $tailnet = "taila2a6d7.ts.net"
           $baseUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
 
-          try {
-            $resp = curl -s -u "$env:TAILSCALE_API_KEY:`"" $baseUrl
-            $machines = ($resp.Content | ConvertFrom-Json).machines
-            foreach ($m in $machines) {
-              if ($m.hostname -like "rdp-ci-node*") {
-                if (-not $m.online) {
-                  Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
-                  curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)"
+          # Run cleanup in a background job with 30s timeout, skip if it hangs
+          $job = Start-Job {
+            try {
+              $resp = curl -s -u "$using:TAILSCALE_API_KEY:`"" $using:baseUrl
+              $machines = ($resp.Content | ConvertFrom-Json).machines
+              foreach ($m in $machines) {
+                if ($m.hostname -like "rdp-ci-node*") {
+                  if (-not $m.online) {
+                    Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
+                    curl -s -X DELETE -u "$using:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)"
+                  }
                 }
               }
+            } catch {
+              Write-Warning "Ghost cleanup failed"
             }
-          } catch {
-            Write-Warning "Ghost cleanup failed or skipped"
           }
+          if (-not (Wait-Job $job -Timeout 30)) {
+            Write-Warning "Ghost cleanup timed out, skipping..."
+            Stop-Job $job -Force | Out-Null
+          }
+          Remove-Job $job | Out-Null
 
       - name: Configure Core RDP Settings
         shell: pwsh
@@ -63,13 +67,69 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User
+      - name: Create/Update RDP User (simplified)
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
           INPUT_PASSWORD: ${{ github.event.inputs.password }}
-          INPUT_ALLOW_WEAK: ${{ github.event.inputs.allow_weak_password }}
         run: |
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
-          $inputPassword = if ($env:INPUT_PASSWORD -eq '') { $null } else { $env:INPUT_PASSWORD }
-          $allowWeak = ($env:INPUT_ALLOW_WEAK -eq 'true')
+          $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
+
+          $securePass = ConvertTo-SecureString $finalPassword -AsPlainText -Force
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            try { Set-LocalUser -Name $username -Password $securePass }
+            catch {
+              Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+            }
+          } else {
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: $username | Password: $finalPassword"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection (Fixed Hostname)
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH }} `
+            --hostname=rdp-ci-node `
+            --accept-routes --accept-dns
+
+          $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
+
+      - name: Maintain Connection (Show MagicDNS + creds)
+        shell: pwsh
+        run: |
+          $TailnetDomain = "taila2a6d7.ts.net"
+          $hostname = "rdp-ci-node.$TailnetDomain"
+
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Connect using MagicDNS: $hostname"
+          Write-Host "Fallback IP: $env:TAILSCALE_IP"
+          $creds = (Get-Content $env:GITHUB_ENV | Where-Object { $_ -like 'RDP_CREDS=*' })
+          Write-Host $creds
+          Write-Host "==================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active → Connect via DNS $hostname"
+            Start-Sleep -Seconds 300
+          }
