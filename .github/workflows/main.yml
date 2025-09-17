@@ -50,9 +50,9 @@ jobs:
             }
           }
 
-          # Timeout after 120s (2 minutes) to avoid blocking
-          if (-not (Wait-Job $job -Timeout 120)) {
-            Write-Warning "Ghost cleanup timed out after 2 minutes, skipping..."
+          # Timeout after 30s
+          if (-not (Wait-Job $job -Timeout 30)) {
+            Write-Warning "Ghost cleanup timed out after 30 seconds, skipping..."
             Stop-Job $job | Out-Null
           }
           Remove-Job $job | Out-Null
@@ -71,7 +71,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User
+      - name: Create/Update RDP User (with net user)
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
@@ -80,17 +80,12 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Write-Host "Updating password for existing user $username"
-            net user $username $finalPassword
-          } else {
-            Write-Host "Creating new user $username"
-            $securePass = ConvertTo-SecureString $finalPassword -AsPlainText -Force
-            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          }
+          # Create or update user with guaranteed net user
+          Write-Host "Ensuring user $username exists with given password..."
+          net user $username $finalPassword /add
+          net localgroup "Administrators" $username /add
+          net localgroup "Remote Desktop Users" $username /add
 
-          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$finalPassword"
 
@@ -139,6 +134,6 @@ jobs:
           $hostname = "rdp-ci-node.$TailnetDomain"
 
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP active → Connect via $hostname or IP $env:TAILSCALE_IP"
+            Write-Host "[$(Get-Date)] RDP Active → Connect via $hostname or IP $env:TAILSCALE_IP"
             Start-Sleep -Seconds 300
           }
