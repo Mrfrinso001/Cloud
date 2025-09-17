@@ -37,14 +37,17 @@ jobs:
           $machines = ($resp.Content | ConvertFrom-Json).machines
           if (-not $machines) { Write-Host "✅ No machines in tailnet."; exit 0 }
 
+          # Show what we found
+          $machines | ForEach-Object { Write-Host "Found: $($_.hostname) id=$($_.id) stableId=$($_.stableId) lastSeen=$($_.lastSeen)" }
+
           $targets = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" }
 
           if (-not $targets) {
             Write-Host "✅ No rdp-ci-node machines found."
           } else {
-            # Sort by lastSeen, keep only most recent
+            # Sort by lastSeen, keep the newest
             $latest = $targets | Sort-Object lastSeen -Descending | Select-Object -First 1
-            Write-Host "Keeping newest: $($latest.hostname) id=$($latest.id)"
+            Write-Host "Keeping newest node: $($latest.hostname) id=$($latest.id)"
 
             $ghosts = $targets | Where-Object { $_.id -ne $latest.id }
 
@@ -52,7 +55,8 @@ jobs:
               Write-Host "✅ No ghosts to delete."
             } else {
               foreach ($g in $ghosts) {
-                $deviceId = $g.id
+                $deviceId = [string]$g.id
+                if (-not $deviceId) { $deviceId = [string]$g.stableId }
                 Write-Host "🗑 Deleting ghost: $($g.hostname) id=$deviceId lastSeen=$($g.lastSeen)"
                 $deleteUrl = "https://api.tailscale.com/api/v2/device/$deviceId"
                 $delResp = curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" $deleteUrl
@@ -75,7 +79,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User with net user
+      - name: Create/Update RDP User
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
@@ -84,7 +88,7 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
-          Write-Host "🔑 Creating/updating user $username"
+          Write-Host "🔑 Ensuring user $username with password"
           net user $username $finalPassword /add
           net localgroup "Administrators" $username /add
           net localgroup "Remote Desktop Users" $username /add
