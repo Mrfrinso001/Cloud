@@ -27,33 +27,32 @@ jobs:
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
         run: |
-          $tailnet   = "taila2a6d7.ts.net"
+          $tailnet     = "taila2a6d7.ts.net"
           $machinesUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
 
-          Write-Host "Fetching machine list from Tailscale..."
+          Write-Host "📡 Fetching machine list..."
           $resp = curl -s -u "$env:TAILSCALE_API_KEY:`"" $machinesUrl
-          if (-not $resp) {
-            Write-Host "❌ No response from Tailscale API"
-            exit 0
-          }
+          if (-not $resp) { Write-Host "❌ No response from Tailscale API"; exit 0 }
 
           $machines = ($resp.Content | ConvertFrom-Json).machines
-          if (-not $machines) {
-            Write-Host "✅ No machines found in tailnet."
-            exit 0
-          }
+          if (-not $machines) { Write-Host "✅ No machines in tailnet."; exit 0 }
 
-          $ghosts = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" -and $_.online -eq $false }
+          $targets = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" }
 
-          if (-not $ghosts) {
-            Write-Host "✅ No ghost machines detected."
+          if (-not $targets) {
+            Write-Host "✅ No rdp-ci-node machines found."
           } else {
-            foreach ($g in $ghosts) {
-              $deviceId = $g.id
-              Write-Host "🗑  Deleting ghost: $($g.hostname) [ID=$deviceId]"
-              $deleteUrl = "https://api.tailscale.com/api/v2/device/$deviceId"
-              $delResp = curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" $deleteUrl
-              Write-Host "API response: $delResp"
+            # keep latest only
+            $latest = $targets | Sort-Object created -Descending | Select-Object -First 1
+            $ghosts = $targets | Where-Object { $_.id -ne $latest.id }
+            if (-not $ghosts) {
+              Write-Host "✅ Only the newest node kept ($($latest.hostname))."
+            } else {
+              foreach ($g in $ghosts) {
+                Write-Host "🗑 Deleting ghost: $($g.hostname) [ID=$($g.id)]"
+                $deleteUrl = "https://api.tailscale.com/api/v2/device/$($g.id)"
+                curl -s -X DELETE -u "$env:TAILSCALE_API_KEY:`"" $deleteUrl | Out-Null
+              }
             }
           }
 
@@ -67,11 +66,11 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing firewall rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User (with net user)
+      - name: Create/Update RDP User (reliable password)
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
@@ -80,7 +79,7 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
-          Write-Host "🔑 Ensuring user $username exists"
+          Write-Host "🔑 Creating/updating user $username"
           net user $username $finalPassword /add
           net localgroup "Administrators" $username /add
           net localgroup "Remote Desktop Users" $username /add
@@ -111,7 +110,8 @@ jobs:
         shell: pwsh
         run: |
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "✅ RDP port is open & reachable" }
+          if (-not $testResult.TcpTestSucceeded) { Write-Host "❌ RDP port unreachable"; exit 1 }
+          else { Write-Host "✅ RDP port open & reachable" }
 
       - name: Display Connection Info
         shell: pwsh
