@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Cleanup old Tailscale ghosts (with timeout)
+      - name: Cleanup old Tailscale ghosts
         shell: pwsh
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
@@ -30,26 +30,36 @@ jobs:
           $tailnet = "taila2a6d7.ts.net"
           $baseUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/machines"
 
-          # Run cleanup in a background job with 30s timeout, skip if it hangs
           $job = Start-Job {
             try {
-              $resp = curl -s -u "$using:TAILSCALE_API_KEY:`"" $using:baseUrl
+              $resp = curl -s --max-time 20 -u "$using:TAILSCALE_API_KEY:`"" $using:baseUrl
+              if (-not $resp) {
+                Write-Host "No response from Tailscale API."
+                return
+              }
               $machines = ($resp.Content | ConvertFrom-Json).machines
-              foreach ($m in $machines) {
-                if ($m.hostname -like "rdp-ci-node*") {
-                  if (-not $m.online) {
-                    Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
-                    curl -s -X DELETE -u "$using:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)"
-                  }
+              if (-not $machines) {
+                Write-Host "No machines in tailnet."
+                return
+              }
+              $ghosts = $machines | Where-Object { $_.hostname -like "rdp-ci-node*" -and -not $_.online }
+              if (-not $ghosts) {
+                Write-Host "No ghost machines to remove."
+              } else {
+                foreach ($m in $ghosts) {
+                  Write-Host "Deleting ghost: $($m.hostname) [$($m.id)]"
+                  curl -s --max-time 10 -X DELETE -u "$using:TAILSCALE_API_KEY:`"" "https://api.tailscale.com/api/v2/device/$($m.id)" | Out-Null
                 }
               }
             } catch {
-              Write-Warning "Ghost cleanup failed"
+              Write-Warning "Ghost cleanup failed: $($_.Exception.Message)"
             }
           }
-          if (-not (Wait-Job $job -Timeout 30)) {
-            Write-Warning "Ghost cleanup timed out, skipping..."
-            Stop-Job $job -Force | Out-Null
+
+          # Timeout after 300s (5 minutes) to avoid blocking
+          if (-not (Wait-Job $job -Timeout 300)) {
+            Write-Warning "Ghost cleanup timed out after 5 minutes, skipping..."
+            Stop-Job $job | Out-Null
           }
           Remove-Job $job | Out-Null
 
@@ -67,7 +77,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User (simplified)
+      - name: Create/Update RDP User
         shell: pwsh
         env:
           INPUT_USERNAME: ${{ github.event.inputs.username }}
