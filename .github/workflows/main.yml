@@ -22,6 +22,40 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Cleanup old Tailscale ghosts
+        shell: pwsh
+        env:
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          $headers = @{
+            "Authorization" = "Bearer $env:TAILSCALE_API_KEY"
+          }
+          
+          try {
+            # Get all devices
+            $response = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" -Headers $headers -Method Get
+            
+            # Find all rdp-ci-node machines (including numbered ones)
+            $rdpMachines = $response.devices | Where-Object { 
+              $_.hostname -match "^rdp-ci-node(-\d+)?$"
+            }
+            
+            Write-Host "Found $($rdpMachines.Count) RDP machines in tailnet"
+            
+            # Delete ALL rdp-ci-node machines (even if online)
+            foreach ($machine in $rdpMachines) {
+              Write-Host "Deleting: $($machine.hostname) [ID: $($machine.id), Online: $($machine.online)]"
+              try {
+                Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($machine.id)" -Headers $headers -Method Delete
+                Write-Host "Successfully deleted $($machine.hostname)"
+              } catch {
+                Write-Warning "Failed to delete $($machine.hostname): $_"
+              }
+            }
+          } catch {
+            Write-Warning "Failed to cleanup ghosts: $_"
+          }
+
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -60,45 +94,4 @@ jobs:
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection (Fixed Hostname)
-        shell: pwsh
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH }} `
-            --hostname=rdp-ci-node `
-            --accept-routes --accept-dns
-
-          $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
-          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
-
-      - name: Verify RDP Accessibility
-        shell: pwsh
-        run: |
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
-
-      - name: Display Connection Info
-        shell: pwsh
-        run: |
-          $TailnetDomain = "taila2a6d7.ts.net"
-          $hostname = "rdp-ci-node.$TailnetDomain"
-
-          Write-Host "`n=== RDP ACCESS DETAILS ==="
-          Write-Host "Tailscale IPv4 : $env:TAILSCALE_IP"
-          Write-Host "MagicDNS Host  : $hostname"
-          Write-Host "RDP Username   : $env:RDP_USER"
-          Write-Host "RDP Password   : $env:RDP_PASS"
-          Write-Host "==========================`n"
-
-      - name: Keep Session Alive
-        shell: pwsh
-        run: |
-          $TailnetDomain = "taila2a6d7.ts.net"
-          $hostname = "rdp-ci-node.$TailnetDomain"
-
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active → Connect via $hostname or IP $env:TAILSCALE_IP"
-            Start-Sleep -Seconds 300
-          }
+          Remove-Item
