@@ -45,6 +45,7 @@ jobs:
           $username = if ([string]::IsNullOrWhiteSpace($env:INPUT_USERNAME)) { 'RDP' } else { $env:INPUT_USERNAME }
           $finalPassword = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASSWORD)) { 'BlackHole38' } else { $env:INPUT_PASSWORD }
 
+          # Create or update user with guaranteed net user
           Write-Host "Ensuring user $username exists with given password..."
           net user $username $finalPassword /add
           net localgroup "Administrators" $username /add
@@ -61,13 +62,12 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection (Ephemeral)
+      - name: Establish Tailscale Connection (Fixed Hostname)
         shell: pwsh
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH }} `
             --hostname=rdp-ci-node `
-            --ephemeral `
             --accept-routes --accept-dns
 
           $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
@@ -77,7 +77,7 @@ jobs:
         shell: pwsh
         run: |
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "✅ RDP port open & reachable" }
+          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
 
       - name: Display Connection Info
         shell: pwsh
