@@ -27,13 +27,16 @@ jobs:
         env:
           TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
         run: |
+          # Tailscale API uses Basic Auth with API key as username
+          $base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${env:TAILSCALE_API_KEY}:"))
           $headers = @{
-            "Authorization" = "Bearer $env:TAILSCALE_API_KEY"
+            "Authorization" = "Basic $base64Auth"
           }
           
           try {
-            # Get all devices
-            $response = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" -Headers $headers -Method Get
+            # Get all devices - use your actual tailnet name
+            $tailnet = "taila2a6d7.ts.net"
+            $response = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tailnet/devices" -Headers $headers -Method Get
             
             # Find all rdp-ci-node machines (including numbered ones)
             $rdpMachines = $response.devices | Where-Object { 
@@ -54,6 +57,7 @@ jobs:
             }
           } catch {
             Write-Warning "Failed to cleanup ghosts: $_"
+            # Continue anyway - don't fail the workflow
           }
 
       - name: Configure Core RDP Settings
@@ -81,9 +85,9 @@ jobs:
 
           # Create or update user with guaranteed net user
           Write-Host "Ensuring user $username exists with given password..."
-          net user $username $finalPassword /add
-          net localgroup "Administrators" $username /add
-          net localgroup "Remote Desktop Users" $username /add
+          net user $username $finalPassword /add 2>$null || net user $username $finalPassword
+          net localgroup "Administrators" $username /add 2>$null
+          net localgroup "Remote Desktop Users" $username /add 2>$null
 
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$finalPassword"
@@ -94,4 +98,48 @@ jobs:
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item
+          if (Test-Path $installerPath) {
+            Remove-Item $installerPath -Force
+          }
+
+      - name: Establish Tailscale Connection (Fixed Hostname)
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH }} `
+            --hostname=rdp-ci-node `
+            --accept-routes --accept-dns
+
+          Start-Sleep -Seconds 5
+          $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) { exit 1 } else { Write-Host "RDP port open & reachable" }
+
+      - name: Display Connection Info
+        shell: pwsh
+        run: |
+          $TailnetDomain = "taila2a6d7.ts.net"
+          $hostname = "rdp-ci-node.$TailnetDomain"
+
+          Write-Host "`n=== RDP ACCESS DETAILS ==="
+          Write-Host "Tailscale IPv4 : $env:TAILSCALE_IP"
+          Write-Host "MagicDNS Host  : $hostname"
+          Write-Host "RDP Username   : $env:RDP_USER"
+          Write-Host "RDP Password   : $env:RDP_PASS"
+          Write-Host "==========================`n"
+
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          $TailnetDomain = "taila2a6d7.ts.net"
+          $hostname = "rdp-ci-node.$TailnetDomain"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active → Connect via $hostname or IP $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 300
+          }
